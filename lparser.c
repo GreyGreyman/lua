@@ -594,6 +594,7 @@ static int block_follow (LexState *ls, int withuntil) {
   switch (ls->t.token) {
     case TK_ELSE: case TK_ELSEIF:
     case TK_END: case TK_EOS:
+    case TK_CASE: case TK_DEFAULT:
       return 1;
     case TK_UNTIL: return withuntil;
     default: return 0;
@@ -1205,7 +1206,7 @@ static void checkrepeated (FuncState *fs, Labellist *ll, TString *label) {
 }
 
 
-/* skip no-op statements */
+/* skip no-op s */
 static void skipnoopstat (LexState *ls) {
   while (ls->t.token == ';' || ls->t.token == TK_DBCOLON)
     statement(ls);
@@ -1419,6 +1420,64 @@ static void ifstat (LexState *ls, int line) {
   luaK_patchtohere(fs, escapelist);  /* patch escape list to 'if' end */
 }
 
+//static void check_case
+
+static void test_case_block (LexState *ls, int *escapelist, expdesc *control) {
+  /* test_case_block -> CASE value THEN block */
+  BlockCnt bl;
+  FuncState *fs = ls->fs;
+  expdesc v;
+  int jf;  /* instruction to skip 'then' code (if condition is false) */
+
+  luaX_next(ls);  /* skip CASE */
+  expr(ls, &v);  /* read condition */
+  luaK_posfix(fs, OPR_EQ, &v, control, ls->linenumber);
+  checknext(ls, ':');
+
+  if (ls->t.token == TK_GOTO || ls->t.token == TK_BREAK) {
+    luaK_goiffalse(ls->fs, &v);  /* will jump to label if condition is true */
+    enterblock(fs, &bl, 0);  /* must enter block before 'goto' */
+    gotostat(ls, v.t);  /* handle goto/break */
+    skipnoopstat(ls);  /* skip other no-op statements */
+    if (block_follow(ls, 0)) {  /* 'goto' is the entire block? */
+      leaveblock(fs);
+      return;  /* and that is it */
+    }
+    else  /* must skip over 'then' part if condition is false */
+      jf = luaK_jump(fs);
+  }
+  else {  /* regular case (not goto/break) */
+    luaK_goiftrue(ls->fs, &v);  /* skip over block if condition is false */
+    enterblock(fs, &bl, 0);
+    jf = v.f;
+  }
+  statlist(ls);  /* `then' part */
+  leaveblock(fs);
+
+  if (ls->t.token == TK_CASE ||
+      ls->t.token == TK_DEFAULT)  /* followed by 'default'/'case'? */
+    luaK_concat(fs, escapelist, luaK_jump(fs));  /* must jump over it */
+  luaK_patchtohere(fs, jf);
+}
+
+
+static void switchstat (LexState *ls, int line) {
+  /* switchstat -> SWITCH control CASE value THEN block [DEFAULT block] END */
+  FuncState *fs = ls->fs;
+  int escapelist = NO_JUMP; /* exit list for finished parts */
+  expdesc control;
+  luaX_next(ls); /* skip SWITCH */
+  expr(ls, &control); /* read control */
+  //check(ls, TK_CASE);
+  while (ls->t.token == TK_CASE){
+    expdesc vt = control;
+    test_case_block(ls, &escapelist, &vt);  /* CASE value THEN block */
+  }
+  if (testnext(ls, TK_DEFAULT))
+    block(ls);  /* DEFAULT block */
+  check_match(ls, TK_END, TK_SWITCH, line);
+  luaK_patchtohere(fs, escapelist);  /* patch escape list to 'switch' end */
+}
 
 static void localfunc (LexState *ls) {
   expdesc b;
@@ -1536,6 +1595,10 @@ static void statement (LexState *ls) {
     }
     case TK_IF: {  /* stat -> ifstat */
       ifstat(ls, line);
+      break;
+    }
+    case TK_SWITCH: {  /* stat -> switchstat */
+      switchstat(ls, line);
       break;
     }
     case TK_WHILE: {  /* stat -> whilestat */
